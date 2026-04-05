@@ -30,21 +30,22 @@ def handler(event, context):
     for record in event.get("Records", []):
         body = json.loads(record["body"])
         title = body.get("title")
+        url = body.get("url")
         pages = body.get("pages", 10)
 
-        if not title:
-            logger.warning(f"Skipping record with no title: {body}")
+        if not title and not url:
+            logger.warning(f"Skipping record with no title or url: {body}")
             continue
 
-        logger.info(f"Processing: {title!r} ({pages} pages)")
+        label = url or title
+        logger.info(f"Processing: {label!r} ({pages} pages)")
         try:
-            result = run(title, pages=pages)
-            logger.info(f"Done: {title!r} → {len(result.get('movie_screen_caps', []))} screencaps")
+            result = run(title or "", pages=pages, url=url)
+            logger.info(f"Done: {label!r} → {len(result.get('movie_screen_caps', []))} screencaps")
             results.append(result)
         except Exception as e:
-            logger.error(f"Failed: {title!r} — {e}\n{traceback.format_exc()}")
-            failures.append({"title": title, "error": str(e)})
-            # Re-raise to let SQS retry the message
+            logger.error(f"Failed: {label!r} — {e}\n{traceback.format_exc()}")
+            failures.append({"label": label, "error": str(e)})
             raise
 
     return {

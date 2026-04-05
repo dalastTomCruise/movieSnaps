@@ -106,8 +106,8 @@ def get_image_urls(movie_url: str, page: int) -> list[str]:
         src = img["src"]
         # Strip CDN thumbnail param to get full resolution
         src = src.split("?")[0]
-        # Only grab actual screencap images from the CDN
-        if "caps.b-cdn.net" in src and src.lower().endswith((".jpg", ".jpeg")):
+        # Only grab actual screencap images from the CDN (caps.b-cdn.net, caps2.b-cdn.net, etc.)
+        if "b-cdn.net" in src and src.lower().endswith((".jpg", ".jpeg")):
             images.append(src)
 
     logger.info(f"  Found {len(images)} images on page {page}")

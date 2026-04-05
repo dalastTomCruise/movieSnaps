@@ -9,7 +9,7 @@ import requests
 
 from agent import get_movie_metadata, select_screencaps
 from config import AWS_REGION, BASE_URL, DEFAULT_PAGES_TO_SCRAPE, S3_BUCKET, TARGET_SCREENCAP_COUNT, USER_AGENT
-from scraper import get_image_urls, get_total_pages, sample_pages, search
+from scraper import get_image_urls, get_total_pages, sample_pages, search, MovieEntry
 from storage import (
     ensure_bucket,
     ensure_table,
@@ -23,10 +23,10 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def run(query: str, pages: int = DEFAULT_PAGES_TO_SCRAPE) -> dict:
+def run(query: str, pages: int = DEFAULT_PAGES_TO_SCRAPE, url: str = None) -> dict:
     """
     Full pipeline:
-      1. Search for movie
+      1. Search for movie (or use direct URL)
       2. Scrape X random pages of screencaps → upload to S3
       3. Get movie metadata from Claude
       4. Analyze all uploaded images → select 10
@@ -36,15 +36,30 @@ def run(query: str, pages: int = DEFAULT_PAGES_TO_SCRAPE) -> dict:
     ensure_bucket()
     ensure_table()
 
-    # --- Phase 1: Search ---
-    logger.info(f"Searching for: {query!r}")
-    results = search(query)
-    if not results:
-        raise ValueError(f"No movies found for query: {query!r}")
+    # --- Phase 1: Search or use direct URL ---
+    if url:
+        slug = url.rstrip("/").split("/")[-1]
+        title = slug.replace("-", " ").title()
+        movie = MovieEntry(title=title, url=url, movie_id=slug)
+        logger.info(f"Using direct URL: {url}")
+    else:
+        import re
+        search_query = re.sub(r'\s+4[Kk]\b', '', query).strip()
+        logger.info(f"Searching for: {search_query!r}")
+        results = search(search_query)
+        if not results and search_query != query:
+            logger.info(f"Retrying with original query: {query!r}")
+            results = search(query)
+        if not results:
+            raise ValueError(f"No movies found for query: {query!r}")
+        movie = results[0]
+        logger.info(f"Selected: {movie.title} ({movie.url})")
 
-    # Take the first result
-    movie = results[0]
-    logger.info(f"Selected: {movie.title} ({movie.url})")
+    # --- Skip if already processed ---
+    existing = _s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=f"movies/{movie.movie_id}/", MaxKeys=1)
+    if existing.get("KeyCount", 0) > 0 and not os.environ.get("FORCE_REPROCESS"):
+        logger.info(f"Skipping {movie.title!r} — already has screencaps in S3")
+        return {"movie_id": movie.movie_id, "title": movie.title, "skipped": True, "movie_screen_caps": []}
 
     # --- Phase 2: Collect image URLs (no downloading yet) ---
     total_pages = get_total_pages(movie.url)
@@ -73,6 +88,7 @@ def run(query: str, pages: int = DEFAULT_PAGES_TO_SCRAPE) -> dict:
     metadata["s3_prefix"] = f"movies/{movie.movie_id}/"
     metadata["status"] = "pending"
     metadata["movie_screen_caps"] = []
+    metadata["source_url"] = movie.url
     save_movie(movie.movie_id, metadata)
 
     # --- Phase 4: Agent evaluates raw URLs, picks 10 ---
@@ -128,5 +144,9 @@ def run(query: str, pages: int = DEFAULT_PAGES_TO_SCRAPE) -> dict:
 if __name__ == "__main__":
     import sys
     query = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "Inception"
-    result = run(query)
+    # If arg looks like a URL, pass it as url param
+    if query.startswith("http"):
+        result = run("", url=query)
+    else:
+        result = run(query)
     print(result)

@@ -1,0 +1,133 @@
+"""
+api_handler.py — API Gateway Lambda handler for the movie screencaps game.
+
+Routes:
+  GET /random-movie  — returns a random approved movie with presigned image URLs
+  GET /movie/{id}    — returns a specific movie with presigned image URLs
+"""
+
+import json
+import logging
+import random
+from decimal import Decimal
+
+import boto3
+from boto3.dynamodb.conditions import Attr
+
+from config import AWS_REGION, DYNAMO_TABLE, S3_BUCKET
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+_s3 = boto3.client("s3", region_name=AWS_REGION)
+_dynamo = boto3.resource("dynamodb", region_name=AWS_REGION)
+
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
+
+
+def response(status: int, body: dict) -> dict:
+    return {
+        "statusCode": status,
+        "headers": {**CORS_HEADERS, "Content-Type": "application/json"},
+        "body": json.dumps(body, default=lambda o: int(o) if isinstance(o, Decimal) else str(o)),
+    }
+
+
+def enrich_with_urls(movie: dict, expires: int = 3600) -> dict:
+    """Replace S3 keys with presigned URLs."""
+    keys = movie.get("movie_screen_caps", [])
+    urls = []
+    for key in keys:
+        try:
+            url = _s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": S3_BUCKET, "Key": key},
+                ExpiresIn=expires,
+            )
+            urls.append(url)
+        except Exception as e:
+            logger.warning(f"Failed to generate presigned URL for {key}: {e}")
+    movie["image_urls"] = urls
+    return movie
+
+
+def has_caps(movie: dict) -> bool:
+    return bool(movie.get("movie_screen_caps"))
+
+
+def get_random_movie(exclude: list[str] = None) -> dict | None:
+    table = _dynamo.Table(DYNAMO_TABLE)
+    result = table.scan(FilterExpression=Attr("status").eq("approved"))
+    items = [m for m in result.get("Items", []) if has_caps(m)]
+    if exclude:
+        items = [m for m in items if m["movie_id"] not in exclude]
+    if not items:
+        return None
+    return random.choice(items)
+
+
+def get_movies_by_decade(decade: int, exclude: list[str] = None) -> list[dict]:
+    """Returns all approved movies from a given decade, shuffled."""
+    table = _dynamo.Table(DYNAMO_TABLE)
+    decade_start = decade
+    decade_end = decade + 9
+    result = table.scan(FilterExpression=Attr("status").eq("approved"))
+    items = [
+        m for m in result.get("Items", [])
+        if has_caps(m) and decade_start <= int(m.get("year", 0)) <= decade_end
+    ]
+    if exclude:
+        items = [m for m in items if m["movie_id"] not in exclude]
+    random.shuffle(items)
+    return items
+    table = _dynamo.Table(DYNAMO_TABLE)
+    resp = table.get_item(Key={"movie_id": movie_id})
+    item = resp.get("Item")
+    if item and item.get("status") == "approved" and has_caps(item):
+        return item
+    # Requested movie has no caps — fall back to a random one that does
+    logger.warning(f"Movie '{movie_id}' has no caps, falling back to random")
+    return get_random_movie()
+
+
+def handler(event, context):
+    method = event.get("httpMethod", "GET")
+    path = event.get("path", "/")
+    path_params = event.get("pathParameters") or {}
+
+    # Handle CORS preflight
+    if method == "OPTIONS":
+        return response(200, {})
+
+    if path.startswith("/movies/decade/") and method == "GET":
+        try:
+            decade = int(path.split("/movies/decade/")[-1].rstrip("/"))
+        except ValueError:
+            return response(400, {"error": "Invalid decade. Use format: 1980, 1990, 2000, etc."})
+        params = event.get("queryStringParameters") or {}
+        exclude = [e.strip() for e in params.get("exclude", "").split(",") if e.strip()]
+        movies = get_movies_by_decade(decade, exclude=exclude)
+        if not movies:
+            return response(404, {"error": f"No approved movies found for decade {decade}s"})
+        return response(200, {"decade": decade, "count": len(movies), "movies": [enrich_with_urls(m) for m in movies]})
+
+    if path == "/random-movie" and method == "GET":
+        params = event.get("queryStringParameters") or {}
+        exclude = [e.strip() for e in params.get("exclude", "").split(",") if e.strip()]
+        movie = get_random_movie(exclude=exclude)
+        if not movie:
+            return response(404, {"error": "No approved movies found"})
+        return response(200, enrich_with_urls(movie))
+
+    if path.startswith("/movie/") and method == "GET":
+        movie_id = path_params.get("id") or path.split("/movie/")[-1]
+        movie = get_movie_by_id(movie_id)
+        if not movie:
+            return response(404, {"error": f"Movie '{movie_id}' not found"})
+        return response(200, enrich_with_urls(movie))
+
+    return response(404, {"error": "Not found"})
