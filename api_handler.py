@@ -70,7 +70,25 @@ def get_random_movie(exclude: list[str] = None) -> dict | None:
     return random.choice(items)
 
 
-def get_movies_by_decade(decade: int, exclude: list[str] = None) -> list[dict]:
+def get_available_decades() -> list[dict]:
+    """Returns all decades that have at least one approved movie with caps."""
+    table = _dynamo.Table(DYNAMO_TABLE)
+    result = table.scan(FilterExpression=Attr("status").eq("approved"))
+    decade_counts = {}
+    for m in result.get("Items", []):
+        if not has_caps(m):
+            continue
+        year = m.get("year")
+        if year is None:
+            continue
+        try:
+            year = int(year)
+        except (ValueError, TypeError):
+            continue
+        if year:
+            decade = (year // 10) * 10
+            decade_counts[decade] = decade_counts.get(decade, 0) + 1
+    return sorted([{"decade": d, "count": c} for d, c in decade_counts.items()], key=lambda x: x["decade"])
     """Returns all approved movies from a given decade, shuffled."""
     table = _dynamo.Table(DYNAMO_TABLE)
     decade_start = decade
@@ -102,6 +120,10 @@ def handler(event, context):
     # Handle CORS preflight
     if method == "OPTIONS":
         return response(200, {})
+
+    if path == "/decades" and method == "GET":
+        decades = get_available_decades()
+        return response(200, {"decades": decades})
 
     if path.startswith("/movies/decade/") and method == "GET":
         try:

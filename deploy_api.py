@@ -111,6 +111,18 @@ def deploy_api(lambda_arn: str) -> str:
     add_method(id_resource, "GET", lambda_arn)
     add_method(id_resource, "OPTIONS", lambda_arn)
 
+    # /decades
+    decades_id = ensure_resource(root_id, "decades")
+    add_method(decades_id, "GET", lambda_arn)
+    add_method(decades_id, "OPTIONS", lambda_arn)
+
+    # /movies/decade/{decade}
+    movies_id = ensure_resource(root_id, "movies")
+    decade_id = ensure_resource(movies_id, "decade")
+    decade_val_id = ensure_resource(decade_id, "{decade}")
+    add_method(decade_val_id, "GET", lambda_arn)
+    add_method(decade_val_id, "OPTIONS", lambda_arn)
+
     # Grant API Gateway permission to invoke Lambda
     try:
         lambda_client.add_permission(
@@ -137,3 +149,5 @@ if __name__ == "__main__":
     logger.info(f"\n✅ API deployed!")
     logger.info(f"  GET {base_url}/random-movie")
     logger.info(f"  GET {base_url}/movie/{{movie_id}}")
+    logger.info(f"  GET {base_url}/decades")
+    logger.info(f"  GET {base_url}/movies/decade/{{decade}}")
