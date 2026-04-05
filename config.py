@@ -3,7 +3,7 @@
 AWS_REGION = "us-east-1"
 S3_BUCKET = "movie-screencaps-game"
 DYNAMO_TABLE = "movies"
-BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+BEDROCK_MODEL_ID = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
 
 # Set to True to log rejection/approval reasons from Claude (slower, for debugging)
 VERBOSE_AGENT = False

@@ -100,28 +100,61 @@ def deploy_api(lambda_arn: str) -> str:
             integrationHttpMethod="POST", uri=uri,
         )
 
+    def add_cors_options(resource_id: str):
+        """Add a mock OPTIONS method that returns CORS headers without hitting Lambda."""
+        try:
+            apigw.put_method(
+                restApiId=api_id, resourceId=resource_id,
+                httpMethod="OPTIONS", authorizationType="NONE",
+            )
+        except apigw.exceptions.ConflictException:
+            pass
+        apigw.put_integration(
+            restApiId=api_id, resourceId=resource_id,
+            httpMethod="OPTIONS", type="MOCK",
+            requestTemplates={"application/json": '{"statusCode": 200}'},
+        )
+        apigw.put_method_response(
+            restApiId=api_id, resourceId=resource_id,
+            httpMethod="OPTIONS", statusCode="200",
+            responseParameters={
+                "method.response.header.Access-Control-Allow-Headers": False,
+                "method.response.header.Access-Control-Allow-Methods": False,
+                "method.response.header.Access-Control-Allow-Origin": False,
+            },
+        )
+        apigw.put_integration_response(
+            restApiId=api_id, resourceId=resource_id,
+            httpMethod="OPTIONS", statusCode="200",
+            responseParameters={
+                "method.response.header.Access-Control-Allow-Headers": "'Content-Type'",
+                "method.response.header.Access-Control-Allow-Methods": "'GET,OPTIONS'",
+                "method.response.header.Access-Control-Allow-Origin": "'*'",
+            },
+        )
+
     # /random-movie
     random_id = ensure_resource(root_id, "random-movie")
     add_method(random_id, "GET", lambda_arn)
-    add_method(random_id, "OPTIONS", lambda_arn)
+    add_cors_options(random_id)
 
     # /movie/{id}
     movie_id = ensure_resource(root_id, "movie")
     id_resource = ensure_resource(movie_id, "{id}")
     add_method(id_resource, "GET", lambda_arn)
-    add_method(id_resource, "OPTIONS", lambda_arn)
+    add_cors_options(id_resource)
 
     # /decades
     decades_id = ensure_resource(root_id, "decades")
     add_method(decades_id, "GET", lambda_arn)
-    add_method(decades_id, "OPTIONS", lambda_arn)
+    add_cors_options(decades_id)
 
     # /movies/decade/{decade}
     movies_id = ensure_resource(root_id, "movies")
     decade_id = ensure_resource(movies_id, "decade")
     decade_val_id = ensure_resource(decade_id, "{decade}")
     add_method(decade_val_id, "GET", lambda_arn)
-    add_method(decade_val_id, "OPTIONS", lambda_arn)
+    add_cors_options(decade_val_id)
 
     # Grant API Gateway permission to invoke Lambda
     try:

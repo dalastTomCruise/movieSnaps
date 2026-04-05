@@ -89,6 +89,9 @@ def get_available_decades() -> list[dict]:
             decade = (year // 10) * 10
             decade_counts[decade] = decade_counts.get(decade, 0) + 1
     return sorted([{"decade": d, "count": c} for d, c in decade_counts.items()], key=lambda x: x["decade"])
+
+
+def get_movies_by_decade(decade: int, exclude: list[str] = None) -> list[dict]:
     """Returns all approved movies from a given decade, shuffled."""
     table = _dynamo.Table(DYNAMO_TABLE)
     decade_start = decade
@@ -96,12 +99,15 @@ def get_available_decades() -> list[dict]:
     result = table.scan(FilterExpression=Attr("status").eq("approved"))
     items = [
         m for m in result.get("Items", [])
-        if has_caps(m) and decade_start <= int(m.get("year", 0)) <= decade_end
+        if has_caps(m) and m.get("year") is not None and decade_start <= int(m.get("year", 0)) <= decade_end
     ]
     if exclude:
         items = [m for m in items if m["movie_id"] not in exclude]
     random.shuffle(items)
     return items
+
+
+def get_movie_by_id(movie_id: str) -> dict | None:
     table = _dynamo.Table(DYNAMO_TABLE)
     resp = table.get_item(Key={"movie_id": movie_id})
     item = resp.get("Item")
