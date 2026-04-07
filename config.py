@@ -3,16 +3,20 @@
 AWS_REGION = "us-east-1"
 S3_BUCKET = "movie-screencaps-game"
 DYNAMO_TABLE = "movies"
-BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+
+BEDROCK_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
 
 # Set to True to log rejection/approval reasons from Claude (slower, for debugging)
-VERBOSE_AGENT = False
+VERBOSE_AGENT = True
 
 # Scraper settings
 DEFAULT_PAGES_TO_SCRAPE = 10
 MAX_EVALUATION_SECONDS = 900  # 15 minutes — write whatever was approved and move on
 MAX_IMAGE_ERRORS = 50  # stop evaluating if too many CDN 404s
-TARGET_SCREENCAP_COUNT = 10
+TARGET_SCREENCAP_COUNT = 5
+SPREAD_INDEXES_PER_PAGE = 8  # images sampled per page, evenly spread across the page timeline
+IMAGES_TO_SHOW_CAP = 6  # max images shown to player per movie
 REQUEST_DELAY_SECONDS = 1.0
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "

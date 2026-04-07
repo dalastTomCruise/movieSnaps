@@ -112,3 +112,21 @@ def get_image_urls(movie_url: str, page: int) -> list[str]:
 
     logger.info(f"  Found {len(images)} images on page {page}")
     return images
+
+
+def spread_sample(images: list[str], n: int) -> list[str]:
+    """
+    Pick n images evenly spread across the full list with guaranteed distance between picks.
+    Divides the list into n equal buckets and picks one random image per bucket.
+    Minimum distance between any two picks = bucket_size (never adjacent).
+    e.g. for 180 images and n=12: bucket_size=15, picks one random from each [0-14],[15-29],...
+    """
+    if len(images) <= n:
+        return images
+    bucket_size = len(images) // n
+    result = []
+    for i in range(n):
+        bucket_start = i * bucket_size
+        bucket_end = bucket_start + bucket_size
+        result.append(images[random.randint(bucket_start, bucket_end - 1)])
+    return result

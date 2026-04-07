@@ -38,7 +38,30 @@ def response(status: int, body: dict) -> dict:
 
 
 def enrich_with_urls(movie: dict, expires: int = 3600) -> dict:
-    """Replace S3 keys with presigned URLs."""
+    """
+    Serve presigned_urls directly from DB if available (generated nightly, valid 24h).
+    Falls back to generating on-the-fly from movie_screen_caps if not present.
+    """
+    # Use pre-generated presigned URLs if available
+    if movie.get("presigned_urls"):
+        movie["images_to_show"] = movie["presigned_urls"]
+    else:
+        # Fallback: generate presigned URLs on the fly from images_to_show keys
+        show_keys = movie.get("images_to_show", [])
+        show_urls = []
+        for key in show_keys:
+            try:
+                url = _s3.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": S3_BUCKET, "Key": key},
+                    ExpiresIn=expires,
+                )
+                show_urls.append(url)
+            except Exception as e:
+                logger.warning(f"Failed to generate presigned URL for {key}: {e}")
+        movie["images_to_show"] = show_urls
+
+    # Full screencap list (on-demand, for backwards compat)
     keys = movie.get("movie_screen_caps", [])
     urls = []
     for key in keys:
@@ -52,6 +75,7 @@ def enrich_with_urls(movie: dict, expires: int = 3600) -> dict:
         except Exception as e:
             logger.warning(f"Failed to generate presigned URL for {key}: {e}")
     movie["image_urls"] = urls
+
     return movie
 
 
@@ -68,6 +92,37 @@ def get_random_movie(exclude: list[str] = None) -> dict | None:
     if not items:
         return None
     return random.choice(items)
+
+
+import re
+
+def clean_title(title: str, year) -> str:
+    """Strip year suffix appended by pipeline e.g. 'Pulp Fiction 1994' -> 'Pulp Fiction'"""
+    if not title:
+        return title
+    # Remove trailing year like ' 1994' or ' (1994)'
+    cleaned = re.sub(r'\s*\(?\d{4}\)?$', '', title.strip())
+    return cleaned.strip() or title
+
+
+def get_all_movies() -> list[dict]:
+    """Returns lightweight list of all approved movies for search/hard mode."""
+    table = _dynamo.Table(DYNAMO_TABLE)
+    result = table.scan(
+        FilterExpression=Attr("status").eq("approved"),
+        ProjectionExpression="movie_id, title, #yr",
+        ExpressionAttributeNames={"#yr": "year"},
+    )
+    movies = []
+    for m in result.get("Items", []):
+        title = m.get("title") or m.get("movie_id", "")
+        year = m.get("year")
+        movies.append({
+            "movie_id": m["movie_id"],
+            "title": clean_title(title, year),
+            "year": int(year) if year else None,
+        })
+    return sorted(movies, key=lambda x: x["title"] or "")
 
 
 def get_available_decades() -> list[dict]:
@@ -124,6 +179,10 @@ def handler(event, context):
     if path == "/decades" and method == "GET":
         decades = get_available_decades()
         return response(200, {"decades": decades})
+
+    if path == "/movies" and method == "GET":
+        movies = get_all_movies()
+        return response(200, {"movies": movies, "count": len(movies)})
 
     if path.startswith("/movies/decade/") and method == "GET":
         try:
