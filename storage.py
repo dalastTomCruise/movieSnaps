@@ -123,11 +123,12 @@ def update_screencaps(movie_id: str, screencap_keys: list[str]) -> None:
     table = _dynamo.Table(DYNAMO_TABLE)
     table.update_item(
         Key={"movie_id": movie_id},
-        UpdateExpression="SET movie_screen_caps = :caps, #st = :status",
+        UpdateExpression="SET movie_screen_caps = :caps, #st = :status, updated_at = :ts",
         ExpressionAttributeNames={"#st": "status"},
         ExpressionAttributeValues={
             ":caps": screencap_keys,
             ":status": "approved",
+            ":ts": datetime.now(timezone.utc).isoformat(),
         },
     )
     logger.info(f"Updated screencaps for {movie_id!r}")

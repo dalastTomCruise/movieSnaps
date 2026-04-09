@@ -102,9 +102,12 @@ def get_similar_movies(metadata: dict) -> list[str]:
     except Exception as e:
         logger.warning(f"Failed to get similar movies: {e}")
         return []
+
+
+def generate_selection_guide(metadata: dict) -> str:
     """
-    Ask Haiku to produce a tailored image selection guide based on the movie's metadata.
-    Returns a plain-text guide used as the evaluation prompt for this specific movie.
+    Ask Haiku to produce a detailed, movie-specific evaluation prompt.
+    This becomes the actual instructions the image evaluator follows.
     """
     title = metadata.get("title", "Unknown")
     year = metadata.get("year", "")
@@ -112,19 +115,32 @@ def get_similar_movies(metadata: dict) -> list[str]:
     genres = ", ".join(metadata.get("genres") or [])
     synopsis = metadata.get("synopsis", "")
 
-    system = "You are an expert movie screencap curator. Return only plain text, no markdown, no JSON."
+    system = "You are an expert film analyst. Return only plain text, no markdown, no JSON."
     prompt = (
         f"Movie: \"{title}\" ({year})\n"
         f"Genres: {genres}\n"
         f"Cast: {cast}\n"
         f"Synopsis: {synopsis}\n\n"
-        f"Write a concise image selection guide (max 150 words) for a movie guessing game curator "
-        f"who is reviewing screencaps from this film. The guide should:\n"
-        f"1. Note whether this is a people-heavy film, animation, nature documentary, etc. and how strict to be about rejecting people\n"
-        f"2. List 3-5 specific things to APPROVE (e.g. 'empty diner interiors', 'desert landscapes', 'close-ups of props')\n"
-        f"3. List 3-5 specific things to REJECT that would give this movie away (e.g. 'the briefcase', 'the gimp mask', 'Uma Thurman's face')\n"
-        f"4. One sentence on the overall visual style to look for\n\n"
-        f"Be specific to THIS movie. Do not be generic."
+        f"Write a DETAILED image evaluation guide (max 300 words) for someone reviewing screencaps "
+        f"from this film for a movie guessing game. The reviewer has never seen the movie and needs "
+        f"your expertise to know what to approve and reject.\n\n"
+        f"The guide MUST include:\n\n"
+        f"1. MAIN CAST VISUAL DESCRIPTIONS — For each main cast member, describe exactly what they "
+        f"look like in this film so the reviewer can spot them. Include hair color, distinctive "
+        f"clothing, costumes, makeup, or physical traits. For animated films, describe the main "
+        f"characters' visual design (colors, shapes, distinctive features).\n\n"
+        f"2. ICONIC SYMBOLS & PROPS TO REJECT — List specific objects, logos, symbols, vehicles, "
+        f"or props that would immediately identify this movie (e.g. 'the X logo', 'Wolverine's claws', "
+        f"'the yellow spandex suits', 'the Cerebro helmet'). These must be rejected.\n\n"
+        f"3. ICONIC SCENES TO REJECT — Describe 3-5 specific scenes or locations that are so famous "
+        f"they'd give the movie away instantly.\n\n"
+        f"4. GOOD PICKS — List 5-8 types of shots that would work well: generic environments, "
+        f"background details, non-distinctive props, crowd scenes without main cast, etc. "
+        f"Be specific to this film's setting and era.\n\n"
+        f"5. PEOPLE RULES — Explain that background extras, crowds, and non-main-cast people "
+        f"are ALLOWED (about 20% of picks should include these). Only main cast members must be rejected. "
+        f"For animated films, only main characters must be rejected — background animated people are fine.\n\n"
+        f"Be extremely specific to THIS movie. Use your knowledge of the film."
     )
 
     try:
@@ -137,7 +153,7 @@ def get_similar_movies(metadata: dict) -> list[str]:
 
 
 def _load_image_b64(url: str) -> str:
-    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://movie-screencaps.com/"}, timeout=10)
+    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://movie-screencaps.com/"}, timeout=1)
     resp.raise_for_status()
     img = Image.open(io.BytesIO(resp.content))
     if max(img.size) > 1568:
@@ -147,24 +163,28 @@ def _load_image_b64(url: str) -> str:
     return base64.standard_b64encode(buf.getvalue()).decode("utf-8")
 
 
-def _evaluate_batch(urls: list[str], prompt: str, system: str, batch_label: str) -> list[str]:
+def _evaluate_batch(urls: list[str], prompt: str, system: str, batch_label: str) -> list[dict]:
     """
     Run a batch of image URLs through Haiku with the given prompt.
-    Returns the list of URLs that were approved.
+    Returns list of {"url": str, "has_people": bool} for approved images.
     """
     approved = []
     batch_size = 20
     image_errors = 0
 
     for batch_start in range(0, len(urls), batch_size):
-        batch = urls[batch_start: batch_start + batch_size]
+        if isinstance(urls[0], dict):
+            batch = urls[batch_start: batch_start + batch_size]
+            batch_urls = [u["url"] for u in batch]
+        else:
+            batch_urls = urls[batch_start: batch_start + batch_size]
         batch_num = batch_start // batch_size + 1
-        logger.info(f"  [{batch_label}] Batch {batch_num} ({len(batch)} images)...")
+        logger.info(f"  [{batch_label}] Batch {batch_num} ({len(batch_urls)} images)...")
 
         content = [{"type": "text", "text": prompt}]
         valid_indices = []
 
-        for idx, url in enumerate(batch):
+        for idx, url in enumerate(batch_urls):
             try:
                 b64 = _load_image_b64(url)
                 content.append({"type": "text", "text": f"Image {idx}:"})
@@ -182,7 +202,7 @@ def _evaluate_batch(urls: list[str], prompt: str, system: str, batch_label: str)
         except Exception as e:
             if "ThrottlingException" in str(e) or "Too many tokens" in str(e):
                 for attempt in range(5):
-                    wait = (2 ** attempt) * 30
+                    wait = (2 ** attempt) * 5  # 5s, 10s, 20s, 40s, 80s
                     logger.warning(f"Throttled, retrying in {wait}s...")
                     time.sleep(wait)
                     try:
@@ -207,31 +227,50 @@ def _evaluate_batch(urls: list[str], prompt: str, system: str, batch_label: str)
             i = item.get("index")
             a = item.get("approved", False)
             reason = item.get("reason", "")
+            has_people = item.get("has_people", False)
+            has_cast = item.get("has_cast", False)
+            iconic_scene = item.get("iconic_scene", False)
             url = idx_to_url.get(i)
             if url is None:
                 continue
-            if a:
-                approved.append(url)
-                if VERBOSE_AGENT:
-                    logger.info(f"    ✅ [{i}] {reason}")
-                else:
-                    logger.info(f"    ✅ [{i}] approved")
-            elif VERBOSE_AGENT:
-                logger.info(f"    ❌ [{i}] {reason}")
+            tags = []
+            if has_cast:
+                tags.append("🎭")
+            elif has_people:
+                tags.append("👤")
+            else:
+                tags.append("🏠")
+            if iconic_scene:
+                tags.append("⭐")
+            tag_str = "".join(tags)
+            result = {"url": url, "has_people": has_people, "has_cast": has_cast, "iconic_scene": iconic_scene}
+            approved.append(result)
+            if VERBOSE_AGENT:
+                logger.info(f"    {tag_str} [{i}] {reason}")
+            else:
+                logger.info(f"    {tag_str} [{i}] tagged")
 
     return approved
 
 
 def select_screencaps(movie_title: str, image_urls: list[str], metadata: dict = None) -> SelectionResult:
     """
-    Two-pass Haiku evaluation:
-      Pass 1 — filter all candidates, approve scene/object shots with no people
-      Pass 2 — re-check pass 1 approvals, remove any people that slipped through
-    All images surviving both passes are saved — no cap.
+    Single-pass Haiku tagger. No rejection — every image is kept and tagged with:
+      has_people: bool — any person visible (cast or extras)
+      has_cast: bool — main cast member recognizable
+      iconic_scene: bool — recognizable/famous location or moment
     """
+    system = (
+        "You are a fast image tagger for a movie guessing game. "
+        "Tag every image — never reject. "
+        "Return only valid JSON, no markdown."
+    )
+
     movie_context = ""
+    cast_list = []
     if metadata:
-        cast = ", ".join(metadata.get("cast") or [])
+        cast_list = metadata.get("cast") or []
+        cast = ", ".join(cast_list)
         genres = ", ".join(metadata.get("genres") or [])
         synopsis = metadata.get("synopsis", "")
         year = metadata.get("year", "")
@@ -241,59 +280,39 @@ def select_screencaps(movie_title: str, image_urls: list[str], metadata: dict = 
             f"Synopsis: {synopsis}\n\n"
         )
 
-    # Generate a movie-specific selection guide
+    # Generate movie-specific guide for cast identification
     selection_guide = ""
     if metadata:
         logger.info("Generating movie-specific selection guide...")
         selection_guide = generate_selection_guide(metadata)
         if selection_guide:
-            selection_guide = f"\nSELECTION GUIDE FOR THIS MOVIE:\n{selection_guide}\n"
+            selection_guide = f"\nGUIDE:\n{selection_guide}\n"
 
     result = SelectionResult(movie_title=movie_title, total_candidates=len(image_urls))
 
-    # --- Pass 1: scene/object filter ---
-    logger.info(f"\nPass 1 — evaluating {len(image_urls)} candidates...")
-    pass1_system = (
-        "You are an image reviewer for a movie guessing game. "
-        "REJECT any image containing a person or human body part. "
-        "APPROVE only images of environments, objects, animals, or scenes with zero humans. "
-        "Return only valid JSON, no markdown."
-    )
-    pass1_prompt = (
+    logger.info(f"\nTagging {len(image_urls)} images...")
+    prompt = (
         f"{movie_context}"
         f"{selection_guide}"
-        f"ABSOLUTE RULE: If ANY person, human body part, silhouette, shadow, or reflection of a person "
-        f"is visible anywhere in the image — REJECT IT. No exceptions.\n\n"
-        f"✅ APPROVE only: cities, landscapes, nature, animals, signs, objects, buildings, vehicles, props, empty rooms.\n"
-        f"❌ REJECT: any person visible, title cards, credits, blurry images.\n\n"
-        f"Candidates numbered from 0. "
-        f"Return JSON: {{\"evaluations\": [{{\"index\": int, \"approved\": bool{', \"reason\": str' if VERBOSE_AGENT else ''}}}]}}"
-    )
-
-    pass1_approved = _evaluate_batch(image_urls, pass1_prompt, pass1_system, "Pass 1")
-    logger.info(f"Pass 1 result: {len(pass1_approved)}/{len(image_urls)} approved")
-
-    if not pass1_approved:
-        logger.warning("No images survived pass 1")
-        return result
-
-    # --- Pass 2: people verification ---
-    logger.info(f"\nPass 2 — verifying {len(pass1_approved)} images for people...")
-    pass2_system = (
-        "You are a strict people detector. "
-        "Your only job: does this image contain any person, human body part, silhouette, shadow of a person, or reflection of a person? "
-        "Return only valid JSON, no markdown."
-    )
-    pass2_prompt = (
-        f"For each image below, check ONLY: is any person or human body part visible anywhere?\n"
-        f"This includes: faces, hands, feet, arms, legs, torsos, silhouettes, shadows of people, reflections of people.\n"
-        f"If YES — approved: false. If NO person at all — approved: true.\n\n"
+        f"Tag every image. Do NOT reject any — tag all of them.\n\n"
+        f"For each image, determine:\n"
+        f"- has_people: true if ANY person is visible (cast, extras, crowds, silhouettes)\n"
+        f"- has_cast: true if a MAIN CAST MEMBER is recognizable (face, distinctive costume, or features). "
+        f"Main cast: {', '.join(cast_list) if cast_list else 'unknown'}\n"
+        f"- iconic_scene: true if this is a famous/recognizable location or moment from the film\n\n"
         f"Images numbered from 0. "
-        f"Return JSON: {{\"evaluations\": [{{\"index\": int, \"approved\": bool{', \"reason\": str' if VERBOSE_AGENT else ''}}}]}}"
+        f"Return JSON: {{\"evaluations\": [{{\"index\": int, \"has_people\": bool, \"has_cast\": bool, \"iconic_scene\": bool}}]}}"
     )
 
-    pass2_approved = _evaluate_batch(pass1_approved, pass2_prompt, pass2_system, "Pass 2")
-    logger.info(f"Pass 2 result: {len(pass2_approved)}/{len(pass1_approved)} survived")
+    tagged = _evaluate_batch(image_urls, prompt, system, "Tag")
+    logger.info(f"Tagged {len(tagged)}/{len(image_urls)} images")
 
-    result.approved_urls = pass2_approved
+    # Stats
+    n_cast = sum(1 for t in tagged if t.get("has_cast"))
+    n_people = sum(1 for t in tagged if t.get("has_people") and not t.get("has_cast"))
+    n_empty = sum(1 for t in tagged if not t.get("has_people"))
+    n_iconic = sum(1 for t in tagged if t.get("iconic_scene"))
+    logger.info(f"  🎭 cast: {n_cast} | 👤 extras: {n_people} | 🏠 empty: {n_empty} | ⭐ iconic: {n_iconic}")
+
+    result.approved_urls = tagged
     return result

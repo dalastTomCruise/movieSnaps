@@ -14,7 +14,7 @@ from decimal import Decimal
 import boto3
 from boto3.dynamodb.conditions import Attr
 
-from config import AWS_REGION, DYNAMO_TABLE, S3_BUCKET
+from config import AWS_REGION, DYNAMO_TABLE, LEADERBOARD_TABLE, S3_BUCKET
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -41,40 +41,53 @@ def enrich_with_urls(movie: dict, expires: int = 3600) -> dict:
     """
     Serve presigned_urls directly from DB if available (generated nightly, valid 24h).
     Falls back to generating on-the-fly from movie_screen_caps if not present.
+    Also serves hard_images_to_show for hard mode.
     """
-    # Use pre-generated presigned URLs if available
+    # Normal mode
     if movie.get("presigned_urls"):
         movie["images_to_show"] = movie["presigned_urls"]
     else:
-        # Fallback: generate presigned URLs on the fly from images_to_show keys
         show_keys = movie.get("images_to_show", [])
         show_urls = []
         for key in show_keys:
             try:
-                url = _s3.generate_presigned_url(
-                    "get_object",
-                    Params={"Bucket": S3_BUCKET, "Key": key},
-                    ExpiresIn=expires,
-                )
+                url = _s3.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": key}, ExpiresIn=expires)
                 show_urls.append(url)
             except Exception as e:
                 logger.warning(f"Failed to generate presigned URL for {key}: {e}")
         movie["images_to_show"] = show_urls
 
-    # Full screencap list (on-demand, for backwards compat)
+    # Hard mode
+    if movie.get("hard_presigned_urls"):
+        movie["hard_images_to_show"] = movie["hard_presigned_urls"]
+    else:
+        hard_keys = movie.get("hard_images_to_show", [])
+        hard_urls = []
+        for key in hard_keys:
+            try:
+                url = _s3.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": key}, ExpiresIn=expires)
+                hard_urls.append(url)
+            except Exception as e:
+                logger.warning(f"Failed to generate hard presigned URL for {key}: {e}")
+        movie["hard_images_to_show"] = hard_urls
+
+    # Full screencap list with metadata (for dev UI)
     keys = movie.get("movie_screen_caps", [])
-    urls = []
-    for key in keys:
+    all_images = []
+    for item in keys:
+        if isinstance(item, dict):
+            k = item["key"]
+            meta = {"has_people": item.get("has_people", False), "has_cast": item.get("has_cast", False), "iconic_scene": item.get("iconic_scene", False)}
+        else:
+            k = item
+            meta = {"has_people": False, "has_cast": False, "iconic_scene": False}
         try:
-            url = _s3.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": S3_BUCKET, "Key": key},
-                ExpiresIn=expires,
-            )
-            urls.append(url)
+            url = _s3.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": k}, ExpiresIn=expires)
+            all_images.append({"url": url, **meta})
         except Exception as e:
-            logger.warning(f"Failed to generate presigned URL for {key}: {e}")
-    movie["image_urls"] = urls
+            logger.warning(f"Failed to generate presigned URL for {k}: {e}")
+    movie["image_urls"] = [img["url"] for img in all_images]  # backwards compat
+    movie["all_images"] = all_images  # dev UI — includes metadata per image
 
     return movie
 
@@ -110,7 +123,7 @@ def get_all_movies() -> list[dict]:
     table = _dynamo.Table(DYNAMO_TABLE)
     result = table.scan(
         FilterExpression=Attr("status").eq("approved"),
-        ProjectionExpression="movie_id, title, #yr",
+        ProjectionExpression="movie_id, title, #yr, scraped_at, updated_at",
         ExpressionAttributeNames={"#yr": "year"},
     )
     movies = []
@@ -121,8 +134,36 @@ def get_all_movies() -> list[dict]:
             "movie_id": m["movie_id"],
             "title": clean_title(title, year),
             "year": int(year) if year else None,
+            "scraped_at": m.get("scraped_at"),
+            "updated_at": m.get("updated_at"),
         })
     return sorted(movies, key=lambda x: x["title"] or "")
+
+
+def get_movies_by_decade(decade: int, exclude: list[str] = None) -> list[dict]:
+    """Returns all approved movies from a given decade, shuffled."""
+    table = _dynamo.Table(DYNAMO_TABLE)
+    decade_start = decade
+    decade_end = decade + 9
+    result = table.scan(FilterExpression=Attr("status").eq("approved"))
+    items = [
+        m for m in result.get("Items", [])
+        if has_caps(m) and m.get("year") is not None and decade_start <= int(m.get("year", 0)) <= decade_end
+    ]
+    if exclude:
+        items = [m for m in items if m["movie_id"] not in exclude]
+    random.shuffle(items)
+    return items
+
+
+def get_movie_by_id(movie_id: str) -> dict | None:
+    table = _dynamo.Table(DYNAMO_TABLE)
+    resp = table.get_item(Key={"movie_id": movie_id})
+    item = resp.get("Item")
+    if item and item.get("status") == "approved" and has_caps(item):
+        return item
+    logger.warning(f"Movie '{movie_id}' has no caps, falling back to random")
+    return get_random_movie()
 
 
 def get_available_decades() -> list[dict]:
@@ -176,9 +217,171 @@ def handler(event, context):
     if method == "OPTIONS":
         return response(200, {})
 
+    # --- Refresh images_to_show for a movie (dev UI) ---
+    if path.startswith("/movie/") and path.endswith("/refresh") and method == "POST":
+        try:
+            movie_id = path.split("/movie/")[1].split("/refresh")[0]
+            table = _dynamo.Table(DYNAMO_TABLE)
+            item = table.get_item(Key={"movie_id": movie_id}).get("Item", {})
+            caps = item.get("movie_screen_caps", [])
+            if not caps:
+                return response(404, {"error": "No screencaps found"})
+
+            from config import IMAGES_TO_SHOW_CAP
+            from datetime import datetime, timezone
+
+            cast_pool = [c for c in caps if isinstance(c, dict) and c.get("has_cast")]
+            extras_pool = [c for c in caps if isinstance(c, dict) and c.get("has_people") and not c.get("has_cast")]
+            empty_pool = [c for c in caps if isinstance(c, dict) and not c.get("has_people")]
+            if not cast_pool and not extras_pool and not empty_pool:
+                empty_pool = [{"key": c} if isinstance(c, str) else c for c in caps]
+
+            selected = []
+            if cast_pool:
+                selected += random.sample(cast_pool, min(1, len(cast_pool)))
+            if extras_pool:
+                selected += random.sample(extras_pool, min(1, len(extras_pool)))
+            remaining = IMAGES_TO_SHOW_CAP - len(selected)
+            if empty_pool:
+                selected += random.sample(empty_pool, min(remaining, len(empty_pool)))
+            random.shuffle(selected)
+
+            selected_keys = [c["key"] if isinstance(c, dict) else c for c in selected]
+            presigned = [_s3.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": k}, ExpiresIn=86400) for k in selected_keys]
+
+            hard_pool = [c for c in caps if isinstance(c, dict) and not c.get("has_people") and not c.get("iconic_scene")]
+            if not hard_pool:
+                hard_pool = empty_pool
+            hard_selected = random.sample(hard_pool, min(IMAGES_TO_SHOW_CAP, len(hard_pool)))
+            hard_keys = [c["key"] if isinstance(c, dict) else c for c in hard_selected]
+            hard_presigned = [_s3.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": k}, ExpiresIn=86400) for k in hard_keys]
+
+            now = datetime.now(timezone.utc).isoformat()
+            table.update_item(
+                Key={"movie_id": movie_id},
+                UpdateExpression="SET images_to_show = :k, presigned_urls = :u, hard_images_to_show = :hk, hard_presigned_urls = :hu, updated_at = :ts",
+                ExpressionAttributeValues={":k": selected_keys, ":u": presigned, ":hk": hard_keys, ":hu": hard_presigned, ":ts": now},
+            )
+            return response(200, {"movie_id": movie_id, "images_to_show": len(selected_keys), "hard_images_to_show": len(hard_keys), "updated_at": now})
+        except Exception as e:
+            logger.error(f"Refresh failed: {e}")
+            return response(500, {"error": str(e)})
+
+    # --- Delete an image (dev UI) ---
+    if path.startswith("/movie/") and path.endswith("/delete-image") and method == "POST":
+        try:
+            movie_id = path.split("/movie/")[1].split("/delete-image")[0]
+            body = json.loads(event.get("body", "{}"))
+            image_key = body.get("key")
+            if not image_key:
+                return response(400, {"error": "key required"})
+
+            table = _dynamo.Table(DYNAMO_TABLE)
+            item = table.get_item(Key={"movie_id": movie_id}).get("Item", {})
+            caps = item.get("movie_screen_caps", [])
+
+            new_caps = [c for c in caps if not ((isinstance(c, dict) and c.get("key") == image_key) or (isinstance(c, str) and c == image_key))]
+            if len(new_caps) == len(caps):
+                return response(404, {"error": f"Image key not found: {image_key}"})
+
+            # Delete from S3
+            try:
+                _s3.delete_object(Bucket=S3_BUCKET, Key=image_key)
+            except Exception as e:
+                logger.warning(f"S3 delete failed for {image_key}: {e}")
+
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+            table.update_item(
+                Key={"movie_id": movie_id},
+                UpdateExpression="SET movie_screen_caps = :caps, updated_at = :ts",
+                ExpressionAttributeValues={":caps": new_caps, ":ts": now},
+            )
+            return response(200, {"movie_id": movie_id, "deleted": image_key, "remaining": len(new_caps), "updated_at": now})
+        except Exception as e:
+            logger.error(f"Delete image failed: {e}")
+            return response(500, {"error": str(e)})
+
+    # --- Update image metadata (dev UI) ---
+    if path.startswith("/movie/") and path.endswith("/image-meta") and method == "POST":
+        try:
+            movie_id = path.split("/movie/")[1].split("/image-meta")[0]
+            body = json.loads(event.get("body", "{}"))
+            image_key = body.get("key")
+            if not image_key:
+                return response(400, {"error": "key required"})
+
+            table = _dynamo.Table(DYNAMO_TABLE)
+            item = table.get_item(Key={"movie_id": movie_id}).get("Item", {})
+            caps = item.get("movie_screen_caps", [])
+
+            updated = False
+            for cap in caps:
+                if isinstance(cap, dict) and cap.get("key") == image_key:
+                    if "has_people" in body:
+                        cap["has_people"] = bool(body["has_people"])
+                    if "has_cast" in body:
+                        cap["has_cast"] = bool(body["has_cast"])
+                    if "iconic_scene" in body:
+                        cap["iconic_scene"] = bool(body["iconic_scene"])
+                    updated = True
+                    break
+
+            if not updated:
+                return response(404, {"error": f"Image key not found: {image_key}"})
+
+            from datetime import datetime, timezone
+            table.update_item(
+                Key={"movie_id": movie_id},
+                UpdateExpression="SET movie_screen_caps = :caps, updated_at = :ts",
+                ExpressionAttributeValues={":caps": caps, ":ts": datetime.now(timezone.utc).isoformat()},
+            )
+            return response(200, {"movie_id": movie_id, "key": image_key, "updated": True})
+        except Exception as e:
+            logger.error(f"Image meta update failed: {e}")
+            return response(500, {"error": str(e)})
+
+    # --- Leaderboard ---
+    if path == "/score" and method == "POST":
+        try:
+            body = json.loads(event.get("body", "{}"))
+            username = body.get("username", "").strip()[:20]
+            score = int(body.get("score", 0))
+            if not username:
+                return response(400, {"error": "username required"})
+            from datetime import datetime, timezone
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            lb = _dynamo.Table(LEADERBOARD_TABLE)
+            lb.put_item(Item={"username": username, "score": score, "date": today})
+            return response(200, {"username": username, "score": score})
+        except Exception as e:
+            logger.error(f"Score submit failed: {e}")
+            return response(500, {"error": "Failed to submit score"})
+
+    if path == "/leaderboard" and method == "GET":
+        try:
+            from datetime import datetime, timezone
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            lb = _dynamo.Table(LEADERBOARD_TABLE)
+            result = lb.scan(FilterExpression=Attr("date").eq(today))
+            items = sorted(result.get("Items", []), key=lambda x: int(x.get("score", 0)), reverse=True)
+            return response(200, {"date": today, "leaderboard": [{"username": i["username"], "score": int(i["score"])} for i in items[:10]]})
+        except Exception as e:
+            logger.error(f"Leaderboard fetch failed: {e}")
+            return response(500, {"error": "Failed to fetch leaderboard"})
+
     if path == "/decades" and method == "GET":
         decades = get_available_decades()
         return response(200, {"decades": decades})
+
+    if path == "/movies-list" and method == "GET":
+        try:
+            obj = _s3.get_object(Bucket=S3_BUCKET, Key="static/movies-list.json")
+            titles = json.loads(obj["Body"].read())
+            return response(200, {"titles": titles, "count": len(titles)})
+        except Exception as e:
+            logger.error(f"Failed to load movies list: {e}")
+            return response(500, {"error": "Could not load movies list"})
 
     if path == "/movies" and method == "GET":
         movies = get_all_movies()
